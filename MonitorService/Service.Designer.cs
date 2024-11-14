@@ -1,4 +1,4 @@
-﻿namespace PingMonitorService
+﻿namespace MonitorService
 {
     partial class Service
     {

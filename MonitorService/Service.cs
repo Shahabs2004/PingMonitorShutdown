@@ -1,12 +1,12 @@
 ﻿using System;
+using System.Diagnostics;
+using System.IO;
+using System.Net.NetworkInformation;
 using System.ServiceProcess;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Net.NetworkInformation;
-using System.Diagnostics;
-using System.IO;
 
-namespace PingMonitorService
+namespace MonitorService
 {
     public partial class Service : ServiceBase
     {
