@@ -10,67 +10,31 @@ namespace PingMonitorService
 {
     public partial class Service : ServiceBase
     {
-        private CancellationTokenSource _cancellationTokenSource;
-        private string settingsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.ini");
-        private string ipAddress = "10.7.1.30";
-        private int shutdownTimeout = 60;
-        private DateTime? firstFailureTime = null;
-        private bool shutdownInitiated = false;
+        private readonly CancellationTokenSource _cancellationTokenSource;
+        private readonly ServiceConfiguration _config;
+        private readonly INetworkMonitor _networkMonitor;
+        private readonly IShutdownManager _shutdownManager;
+        private DateTime? _firstFailureTime;
 
         public Service()
         {
             InitializeComponent();
             ServiceName = "PingMonitorService";
+            _cancellationTokenSource = new CancellationTokenSource();
+            _config = new ServiceConfiguration(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.ini"));
+            _networkMonitor = new PingMonitor();
+            _shutdownManager = new WindowsShutdownManager();
         }
 
         protected override void OnStart(string[] args)
         {
-            _cancellationTokenSource = new CancellationTokenSource();
             Task.Run(() => MonitorAsync(_cancellationTokenSource.Token));
         }
 
         protected override void OnStop()
         {
             _cancellationTokenSource?.Cancel();
-            if (shutdownInitiated)
-            {
-                CancelShutdown();
-            }
-        }
-
-        private void LoadSettings()
-        {
-            try
-            {
-                if (File.Exists(settingsPath))
-                {
-                    string[] lines = File.ReadAllLines(settingsPath);
-                    foreach (string line in lines)
-                    {
-                        string[] parts = line.Split('=');
-                        if (parts.Length == 2)
-                        {
-                            string key = parts[0].Trim();
-                            string value = parts[1].Trim();
-
-                            switch (key.ToLower())
-                            {
-                                case "ipaddress":
-                                    ipAddress = value;
-                                    break;
-                                case "timeout":
-                                    if (int.TryParse(value, out int timeout))
-                                        shutdownTimeout = timeout;
-                                    break;
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                EventLog.WriteEntry(ServiceName, $"Error loading settings: {ex.Message}", EventLogEntryType.Error);
-            }
+            _shutdownManager.CancelShutdown();
         }
 
         private async Task MonitorAsync(CancellationToken cancellationToken)
@@ -79,93 +43,160 @@ namespace PingMonitorService
             {
                 try
                 {
-                    LoadSettings(); // Reload settings on each iteration to pick up changes
-                    bool pingSuccess = await PingAddressAsync(ipAddress);
-
-                    if (!pingSuccess)
-                    {
-                        if (firstFailureTime == null)
-                        {
-                            firstFailureTime = DateTime.Now;
-                            EventLog.WriteEntry(ServiceName, "Ping failed - starting countdown", EventLogEntryType.Warning);
-                        }
-
-                        TimeSpan timeSinceFailure = DateTime.Now - firstFailureTime.Value;
-                        if (timeSinceFailure.TotalSeconds >= shutdownTimeout && !shutdownInitiated)
-                        {
-                            shutdownInitiated = true;
-                            InitiateShutdown();
-                        }
-                    }
-                    else
-                    {
-                        if (shutdownInitiated)
-                        {
-                            CancelShutdown();
-                            EventLog.WriteEntry(ServiceName, "Connection restored - Shutdown cancelled", EventLogEntryType.Information);
-                            shutdownInitiated = false;
-                        }
-                        firstFailureTime = null;
-                    }
+                    _config.LoadSettings();
+                    await ProcessNetworkStatusAsync();
+                    await Task.Delay(1000, cancellationToken);
                 }
                 catch (Exception ex)
                 {
-                    EventLog.WriteEntry(ServiceName, $"Error in monitoring: {ex.Message}", EventLogEntryType.Error);
+                    LogError("Error in monitoring", ex);
                 }
-
-                await Task.Delay(1000, cancellationToken); // Check every second
             }
         }
 
-        private async Task<bool> PingAddressAsync(string address)
+        private async Task ProcessNetworkStatusAsync()
+        {
+            bool isConnected = await _networkMonitor.CheckConnectionAsync(_config.IpAddress);
+
+            if (!isConnected)
+            {
+                HandleConnectionFailure();
+            }
+            else
+            {
+                HandleConnectionRestored();
+            }
+        }
+
+        private void HandleConnectionFailure()
+        {
+            _firstFailureTime ??= DateTime.Now;
+
+            TimeSpan timeSinceFailure = DateTime.Now - _firstFailureTime.Value;
+            if (timeSinceFailure.TotalSeconds >= _config.ShutdownTimeout && !_shutdownManager.IsShutdownInitiated)
+            {
+                LogWarning("Initiating shutdown due to connection failure");
+                _shutdownManager.InitiateShutdown(_config.ShutdownTimeout);
+            }
+        }
+
+        private void HandleConnectionRestored()
+        {
+            if (_shutdownManager.IsShutdownInitiated)
+            {
+                _shutdownManager.CancelShutdown();
+                LogInfo("Connection restored - Shutdown cancelled");
+            }
+            _firstFailureTime = null;
+        }
+
+        private void LogError(string message, Exception ex) =>
+            EventLog.WriteEntry(ServiceName, $"{message}: {ex.Message}", EventLogEntryType.Error);
+
+        private void LogWarning(string message) =>
+            EventLog.WriteEntry(ServiceName, message, EventLogEntryType.Warning);
+
+        private void LogInfo(string message) =>
+            EventLog.WriteEntry(ServiceName, message, EventLogEntryType.Information);
+    }
+
+    public interface INetworkMonitor
+    {
+        Task<bool> CheckConnectionAsync(string address);
+    }
+
+    public class PingMonitor : INetworkMonitor
+    {
+        public async Task<bool> CheckConnectionAsync(string address)
         {
             try
             {
-                using (Ping ping = new Ping())
-                {
-                    PingReply reply = await ping.SendPingAsync(address, 1000);
-                    return reply.Status == IPStatus.Success;
-                }
+                using var ping = new Ping();
+                var reply = await ping.SendPingAsync(address, 1000);
+                return reply.Status == IPStatus.Success;
             }
             catch
             {
                 return false;
             }
         }
+    }
 
-        private void InitiateShutdown()
+    public interface IShutdownManager
+    {
+        bool IsShutdownInitiated { get; }
+        void InitiateShutdown(int timeout);
+        void CancelShutdown();
+    }
+
+    public class WindowsShutdownManager : IShutdownManager
+    {
+        public bool IsShutdownInitiated { get; private set; }
+
+        public void InitiateShutdown(int timeout)
         {
             try
             {
-                EventLog.WriteEntry(ServiceName, "Initiating shutdown...", EventLogEntryType.Warning);
-                ProcessStartInfo psi = new ProcessStartInfo("shutdown", $"/s /t {shutdownTimeout}")
+                Process.Start(new ProcessStartInfo("shutdown", $"/s /t {timeout}")
                 {
                     CreateNoWindow = true,
                     UseShellExecute = false
-                };
-                Process.Start(psi);
+                });
+                IsShutdownInitiated = true;
             }
-            catch (Exception ex)
+            catch
             {
-                EventLog.WriteEntry(ServiceName, $"Failed to initiate shutdown: {ex.Message}", EventLogEntryType.Error);
-                shutdownInitiated = false;
+                IsShutdownInitiated = false;
+                throw;
             }
         }
 
-        private void CancelShutdown()
+        public void CancelShutdown()
         {
-            try
+            if (!IsShutdownInitiated) return;
+
+            Process.Start(new ProcessStartInfo("shutdown", "/a")
             {
-                ProcessStartInfo psi = new ProcessStartInfo("shutdown", "/a")
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+            IsShutdownInitiated = false;
+        }
+    }
+
+    public class ServiceConfiguration
+    {
+        private readonly string _configPath;
+        public string IpAddress { get; private set; } = "10.7.1.30";
+        public int ShutdownTimeout { get; private set; } = 60;
+
+        public ServiceConfiguration(string configPath)
+        {
+            _configPath = configPath;
+        }
+
+        public void LoadSettings()
+        {
+            if (!File.Exists(_configPath)) return;
+
+            foreach (var line in File.ReadAllLines(_configPath))
+            {
+                var parts = line.Split('=');
+                if (parts.Length != 2) continue;
+
+                var key = parts[0].Trim().ToLower();
+                var value = parts[1].Trim();
+
+                switch (key)
                 {
-                    CreateNoWindow = true,
-                    UseShellExecute = false
-                };
-                Process.Start(psi);
-            }
-            catch (Exception ex)
-            {
-                EventLog.WriteEntry(ServiceName, $"Failed to cancel shutdown: {ex.Message}", EventLogEntryType.Error);
+                    case "ipaddress":
+                        IpAddress = value;
+                        break;
+                    case "timeout":
+                        if (int.TryParse(value, out int timeout))
+                            ShutdownTimeout = timeout;
+                        break;
+                }
             }
         }
     }
