@@ -1,6 +1,8 @@
-﻿namespace MonitorService
+﻿using System.ServiceProcess;
+
+namespace MonitorService
 {
-    partial class Service
+    partial class Service : System.ServiceProcess.ServiceBase
     {
         /// <summary> 
         /// Required designer variable.
@@ -29,7 +31,7 @@
         private void InitializeComponent()
         {
             components = new System.ComponentModel.Container();
-            this.ServiceName = "Service1";
+            this.ServiceName = "Ping to Shutdown Service";
         }
 
         #endregion
